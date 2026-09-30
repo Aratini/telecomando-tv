@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp" android:height="108dp"
+    android:viewportWidth="108" android:viewportHeight="108">
+    <!-- corpo del telecomando -->
+    <path android:fillColor="#FF262D36"
+        android:pathData="M42,26 h24 a8,8 0 0 1 8,8 v40 a8,8 0 0 1 -8,8 h-24 a8,8 0 0 1 -8,-8 v-40 a8,8 0 0 1 8,-8 z" />
+    <!-- tasto accensione -->
+    <path android:fillColor="#FFD8453B"
+        android:pathData="M54,31 m-3.5,0 a3.5,3.5 0 1 0 7,0 a3.5,3.5 0 1 0 -7,0" />
+    <!-- tasto OK -->
+    <path android:fillColor="#FF3B7BFF"
+        android:pathData="M54,50 m-7,0 a7,7 0 1 0 14,0 a7,7 0 1 0 -14,0" />
+    <!-- tasti -->
+    <path android:fillColor="#FFECEFF3"
+        android:pathData="M44,64 h6 v4 h-6 z M51,64 h6 v4 h-6 z M58,64 h6 v4 h-6 z M44,71 h6 v4 h-6 z M51,71 h6 v4 h-6 z M58,71 h6 v4 h-6 z" />
+</vector>
