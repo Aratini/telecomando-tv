@@ -107,8 +107,22 @@ public class SamsungTv {
         setState(State.CONNECTING, "Connessione a " + h + "…");
         String name = Base64.encodeToString(REMOTE_NAME.getBytes(StandardCharsets.UTF_8), Base64.NO_WRAP);
         String token = prefs.getString("token_" + h, null);
-        int preferred = prefs.getInt("port_" + h, 8001);
-        int[] ports = preferred == 8002 ? new int[]{8002, 8001} : new int[]{8001, 8002};
+
+        // I TV con TokenAuthSupport=true (quasi tutti dal 2017 in poi) accettano il WebSocket
+        // sulla 8001 ma poi lo chiudono subito: con loro si usa wss://IP:8002 con token.
+        String authKey = "tokenauth_" + h;
+        if (!prefs.contains(authKey)) {
+            JSONObject info = fetchInfo(h, 1500);
+            if (info != null) {
+                JSONObject dev = info.optJSONObject("device");
+                boolean ta = dev != null && "true".equalsIgnoreCase(dev.optString("TokenAuthSupport"));
+                prefs.edit().putBoolean(authKey, ta).apply();
+            }
+        }
+        boolean tokenAuth = prefs.getBoolean(authKey, false);
+        int preferred = tokenAuth ? 8002 : prefs.getInt("port_" + h, 8001);
+        int[] ports = tokenAuth ? new int[]{8002}
+                : preferred == 8002 ? new int[]{8002, 8001} : new int[]{8001, 8002};
 
         String lastError = "";
         for (int port : ports) {
@@ -120,7 +134,7 @@ public class SamsungTv {
                 path = "/api/v2/channels/samsung.remote.control?name=" + name;
             }
             if (secure && token != null) path += "&token=" + token;
-            WsClient c = new WsClient(new TvListener());
+            WsClient c = new WsClient(new TvListener(port));
             ws = c;
             try {
                 c.connect(h, port, secure, path, 4000);
@@ -153,6 +167,26 @@ public class SamsungTv {
     }
 
     private class TvListener implements WsClient.Listener {
+        private final int port;
+
+        TvListener(int port) {
+            this.port = port;
+        }
+
+        /**
+         * Il TV ha chiuso/rifiutato la 8001 prima di autorizzarci: segna la 8002 come
+         * preferita e riprova subito lì (una sola volta per tentativo).
+         */
+        private boolean fallbackTo8002(WsClient client) {
+            if (port != 8001 || state == State.CONNECTED || host == null) return false;
+            prefs.edit().putInt("port_" + host, 8002).putBoolean("tokenauth_" + host, true).apply();
+            if (ws == client) ws = null;
+            client.close();
+            setState(State.CONNECTING, "Riprovo con connessione sicura (porta 8002)…");
+            exec.execute(SamsungTv.this::doConnect);
+            return true;
+        }
+
         @Override
         public void onMessage(WsClient client, String text) {
             try {
@@ -169,6 +203,7 @@ public class SamsungTv {
                         requestApps();
                         break;
                     case "ms.channel.unauthorized":
+                        if (fallbackTo8002(client)) break;
                         setState(State.DISCONNECTED, "Il TV ha rifiutato l'accesso. Riprova e premi «Consenti» sul TV "
                                 + "(o sblocca il dispositivo in Impostazioni > Generali > Gestione dispositivi esterni).");
                         client.close();
@@ -190,6 +225,7 @@ public class SamsungTv {
         @Override
         public void onClose(WsClient client, String reason) {
             if (ws == client) {
+                if (fallbackTo8002(client)) return;
                 ws = null;
                 if (state != State.DISCONNECTED) setState(State.DISCONNECTED, "Connessione persa (" + reason + ")");
             }
