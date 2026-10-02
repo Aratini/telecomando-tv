@@ -20,7 +20,9 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 
 /**
  * Protocollo "Smart View" dei TV Samsung Tizen (2016+):
@@ -34,6 +36,7 @@ public class SamsungTv {
         public final String id;
         public final String name;
         public final int type;
+        public String iconPath = "";
 
         public AppInfo(String id, String name, int type) {
             this.id = id;
@@ -45,6 +48,12 @@ public class SamsungTv {
     public interface Callback {
         void onState(State state, String message);
         void onApps(List<AppInfo> apps);
+
+        /** Il TV ha aperto (open=true) o chiuso la sua tastiera a schermo; text = testo già presente. */
+        void onTvKeyboard(boolean open, String text);
+
+        /** Icona di un'app arrivata dal TV (immagine PNG/JPG). */
+        void onAppIcon(String appId, byte[] image);
     }
 
     private static final String REMOTE_NAME = "Telecomando Android";
@@ -107,22 +116,8 @@ public class SamsungTv {
         setState(State.CONNECTING, "Connessione a " + h + "…");
         String name = Base64.encodeToString(REMOTE_NAME.getBytes(StandardCharsets.UTF_8), Base64.NO_WRAP);
         String token = prefs.getString("token_" + h, null);
-
-        // I TV con TokenAuthSupport=true (quasi tutti dal 2017 in poi) accettano il WebSocket
-        // sulla 8001 ma poi lo chiudono subito: con loro si usa wss://IP:8002 con token.
-        String authKey = "tokenauth_" + h;
-        if (!prefs.contains(authKey)) {
-            JSONObject info = fetchInfo(h, 1500);
-            if (info != null) {
-                JSONObject dev = info.optJSONObject("device");
-                boolean ta = dev != null && "true".equalsIgnoreCase(dev.optString("TokenAuthSupport"));
-                prefs.edit().putBoolean(authKey, ta).apply();
-            }
-        }
-        boolean tokenAuth = prefs.getBoolean(authKey, false);
-        int preferred = tokenAuth ? 8002 : prefs.getInt("port_" + h, 8001);
-        int[] ports = tokenAuth ? new int[]{8002}
-                : preferred == 8002 ? new int[]{8002, 8001} : new int[]{8001, 8002};
+        int preferred = prefs.getInt("port_" + h, 8001);
+        int[] ports = preferred == 8002 ? new int[]{8002, 8001} : new int[]{8001, 8002};
 
         String lastError = "";
         for (int port : ports) {
@@ -134,7 +129,7 @@ public class SamsungTv {
                 path = "/api/v2/channels/samsung.remote.control?name=" + name;
             }
             if (secure && token != null) path += "&token=" + token;
-            WsClient c = new WsClient(new TvListener(port));
+            WsClient c = new WsClient(new TvListener());
             ws = c;
             try {
                 c.connect(h, port, secure, path, 4000);
@@ -167,26 +162,6 @@ public class SamsungTv {
     }
 
     private class TvListener implements WsClient.Listener {
-        private final int port;
-
-        TvListener(int port) {
-            this.port = port;
-        }
-
-        /**
-         * Il TV ha chiuso/rifiutato la 8001 prima di autorizzarci: segna la 8002 come
-         * preferita e riprova subito lì (una sola volta per tentativo).
-         */
-        private boolean fallbackTo8002(WsClient client) {
-            if (port != 8001 || state == State.CONNECTED || host == null) return false;
-            prefs.edit().putInt("port_" + host, 8002).putBoolean("tokenauth_" + host, true).apply();
-            if (ws == client) ws = null;
-            client.close();
-            setState(State.CONNECTING, "Riprovo con connessione sicura (porta 8002)…");
-            exec.execute(SamsungTv.this::doConnect);
-            return true;
-        }
-
         @Override
         public void onMessage(WsClient client, String text) {
             try {
@@ -203,7 +178,6 @@ public class SamsungTv {
                         requestApps();
                         break;
                     case "ms.channel.unauthorized":
-                        if (fallbackTo8002(client)) break;
                         setState(State.DISCONNECTED, "Il TV ha rifiutato l'accesso. Riprova e premi «Consenti» sul TV "
                                 + "(o sblocca il dispositivo in Impostazioni > Generali > Gestione dispositivi esterni).");
                         client.close();
@@ -215,6 +189,19 @@ public class SamsungTv {
                     case "ed.installedApp.get":
                         parseApps(data);
                         break;
+                    case "ed.apps.icon":
+                        onIconReceived(data);
+                        break;
+                    case "ms.remote.imeStart":
+                    case "ms.remote.imeUpdate": {
+                        String current = decodeImeText(o);
+                        main.post(() -> callback.onTvKeyboard(true, current));
+                        break;
+                    }
+                    case "ms.remote.imeEnd":
+                    case "ms.remote.imeDone":
+                        main.post(() -> callback.onTvKeyboard(false, ""));
+                        break;
                     default:
                         break;
                 }
@@ -225,10 +212,20 @@ public class SamsungTv {
         @Override
         public void onClose(WsClient client, String reason) {
             if (ws == client) {
-                if (fallbackTo8002(client)) return;
                 ws = null;
                 if (state != State.DISCONNECTED) setState(State.DISCONNECTED, "Connessione persa (" + reason + ")");
             }
+        }
+    }
+
+    /** Il testo del campo sul TV arriva (se c'è) in base64 nel campo "data". */
+    private static String decodeImeText(JSONObject o) {
+        String d = o.optString("data", "");
+        if (d.isEmpty() || d.startsWith("{")) return "";
+        try {
+            return new String(Base64.decode(d, Base64.DEFAULT), StandardCharsets.UTF_8);
+        } catch (Exception e) {
+            return "";
         }
     }
 
@@ -242,10 +239,66 @@ public class SamsungTv {
             if (a == null) continue;
             String id = a.optString("appId", "");
             String n = a.optString("name", id);
-            if (!id.isEmpty()) list.add(new AppInfo(id, n, a.optInt("app_type", 2)));
+            if (id.isEmpty()) continue;
+            AppInfo info = new AppInfo(id, n, a.optInt("app_type", 2));
+            info.iconPath = a.optString("icon", "");
+            list.add(info);
         }
         Collections.sort(list, (x, y) -> x.name.compareToIgnoreCase(y.name));
         main.post(() -> callback.onApps(list));
+    }
+
+    // ---------------------------------------------------------------- icone delle app
+
+    private final Object iconLock = new Object();
+    private volatile AppInfo pendingIcon;
+    private volatile CountDownLatch iconLatch;
+    private Thread iconThread;
+
+    /** Chiede al TV le icone delle app indicate, una alla volta (il TV risponde senza dire di quale app si tratta). */
+    public void requestIcons(List<AppInfo> wanted) {
+        synchronized (iconLock) {
+            if (iconThread != null && iconThread.isAlive()) iconThread.interrupt();
+            List<AppInfo> todo = new ArrayList<>();
+            for (AppInfo a : wanted) if (a.iconPath != null && !a.iconPath.isEmpty()) todo.add(a);
+            if (todo.isEmpty()) return;
+            iconThread = new Thread(() -> {
+                for (AppInfo a : todo) {
+                    if (Thread.currentThread().isInterrupted()) return;
+                    WsClient c = ws;
+                    if (c == null || state != State.CONNECTED) return;
+                    CountDownLatch latch = new CountDownLatch(1);
+                    pendingIcon = a;
+                    iconLatch = latch;
+                    c.send(obj("method", "ms.channel.emit", "params", obj("event", "ed.apps.icon", "to", "host",
+                            "data", obj("iconPath", a.iconPath))).toString());
+                    try {
+                        latch.await(2000, TimeUnit.MILLISECONDS);
+                    } catch (InterruptedException e) {
+                        return;
+                    }
+                }
+                pendingIcon = null;
+            }, "icons");
+            iconThread.setDaemon(true);
+            iconThread.start();
+        }
+    }
+
+    private void onIconReceived(JSONObject data) {
+        AppInfo a = pendingIcon;
+        CountDownLatch latch = iconLatch;
+        if (a == null || data == null) return;
+        String b64 = data.optString("imageBase64", "");
+        if (!b64.isEmpty()) {
+            try {
+                byte[] img = Base64.decode(b64, Base64.DEFAULT);
+                String id = a.id;
+                main.post(() -> callback.onAppIcon(id, img));
+            } catch (Exception ignored) {
+            }
+        }
+        if (latch != null) latch.countDown();
     }
 
     private synchronized void setState(State s, String msg) {
@@ -284,6 +337,21 @@ public class SamsungTv {
 
     public void key(String code) {
         send(remote(obj("Cmd", "Click", "DataOfCmd", code, "Option", "false", "TypeOfRemote", "SendRemoteKey")));
+    }
+
+    /** Invia una sequenza di tasti con una pausa tra l'uno e l'altro (es. "canale 21", "volume +5"). */
+    public void keySequence(List<String> codes, long delayMs) {
+        exec.execute(() -> {
+            for (String code : codes) {
+                sendNow(remote(obj("Cmd", "Click", "DataOfCmd", code, "Option", "false",
+                        "TypeOfRemote", "SendRemoteKey")));
+                try {
+                    Thread.sleep(delayMs);
+                } catch (InterruptedException e) {
+                    return;
+                }
+            }
+        });
     }
 
     public void keyPress(String code, boolean down) {

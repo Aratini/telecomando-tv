@@ -2,8 +2,12 @@ package it.andrea.telecomandotv;
 
 import android.app.Activity;
 import android.app.AlertDialog;
+import android.content.ActivityNotFoundException;
+import android.content.Intent;
 import android.content.SharedPreferences;
 import android.content.res.ColorStateList;
+import android.graphics.Bitmap;
+import android.graphics.BitmapFactory;
 import android.graphics.Color;
 import android.graphics.Typeface;
 import android.graphics.drawable.Drawable;
@@ -13,6 +17,7 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.SystemClock;
+import android.speech.RecognizerIntent;
 import android.text.InputType;
 import android.view.Gravity;
 import android.view.HapticFeedbackConstants;
@@ -24,6 +29,7 @@ import android.view.WindowManager;
 import android.widget.CheckBox;
 import android.widget.EditText;
 import android.widget.FrameLayout;
+import android.widget.ImageView;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.Space;
@@ -32,7 +38,11 @@ import android.widget.Toast;
 
 import org.json.JSONObject;
 
+import java.io.File;
+import java.io.FileOutputStream;
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.List;
 
 public class MainActivity extends Activity implements SamsungTv.Callback {
@@ -62,6 +72,18 @@ public class MainActivity extends Activity implements SamsungTv.Callback {
     private List<SamsungTv.AppInfo> apps = defaultApps();
     private boolean pointerMode = false;
 
+    // Tastiera e voce
+    private static final int REQ_VOICE_COMMAND = 101;
+    private static final int REQ_VOICE_DICTATE = 102;
+    private boolean keepConnection = false;   // non disconnettere mentre è aperto il riconoscimento vocale
+    private boolean tvKeyboardOpen = false;   // il TV sta mostrando la sua tastiera a schermo
+    private AlertDialog keyboardDialog;
+
+    // Icone delle app (in memoria + salvate nella cache del telefono)
+    private final Map<String, Bitmap> iconCache = new HashMap<>();
+    private final Map<String, ImageView> iconViews = new HashMap<>();
+    private EditText keyboardField;
+
     // ------------------------------------------------------------------ ciclo di vita
 
     @Override
@@ -81,6 +103,7 @@ public class MainActivity extends Activity implements SamsungTv.Callback {
     @Override
     protected void onResume() {
         super.onResume();
+        keepConnection = false;
         String host = prefs.getString("host", null);
         if (host != null) tv.connect(host);
     }
@@ -88,7 +111,7 @@ public class MainActivity extends Activity implements SamsungTv.Callback {
     @Override
     protected void onPause() {
         super.onPause();
-        tv.disconnect();
+        if (!keepConnection) tv.disconnect();
     }
 
     @Override
@@ -136,6 +159,62 @@ public class MainActivity extends Activity implements SamsungTv.Callback {
         if (list != null && !list.isEmpty()) {
             apps = list;
             fillApps();
+            List<SamsungTv.AppInfo> missing = new ArrayList<>();
+            for (SamsungTv.AppInfo a : list) if (loadIcon(a.id) == null) missing.add(a);
+            tv.requestIcons(missing);
+        }
+    }
+
+    @Override
+    public void onAppIcon(String appId, byte[] image) {
+        Bitmap bmp = BitmapFactory.decodeByteArray(image, 0, image.length);
+        if (bmp == null) return;
+        iconCache.put(appId, bmp);
+        try (FileOutputStream fo = new FileOutputStream(iconFile(appId))) {
+            fo.write(image);
+        } catch (Exception ignored) {
+        }
+        ImageView iv = iconViews.get(appId);
+        if (iv != null) {
+            iv.setImageBitmap(bmp);
+            iv.setBackground(null);
+            View letter = (View) iv.getTag();
+            if (letter != null) letter.setVisibility(View.GONE);
+        }
+    }
+
+    private File iconFile(String appId) {
+        File dir = new File(getCacheDir(), "icons");
+        if (!dir.exists()) dir.mkdirs();
+        return new File(dir, appId.replaceAll("[^A-Za-z0-9._-]", "_") + ".img");
+    }
+
+    private Bitmap loadIcon(String appId) {
+        Bitmap b = iconCache.get(appId);
+        if (b != null) return b;
+        File f = iconFile(appId);
+        if (f.exists()) {
+            b = BitmapFactory.decodeFile(f.getAbsolutePath());
+            if (b != null) iconCache.put(appId, b);
+        }
+        return b;
+    }
+
+    @Override
+    public void onTvKeyboard(boolean open, String text) {
+        boolean wasOpen = tvKeyboardOpen;
+        tvKeyboardOpen = open;
+        if (open) {
+            if (keyboardDialog != null && keyboardDialog.isShowing()) {
+                if (keyboardField != null && keyboardField.getText().length() == 0 && !text.isEmpty()) {
+                    keyboardField.setText(text);
+                    keyboardField.setSelection(text.length());
+                }
+            } else if (!wasOpen && prefs.getBoolean("auto_keyboard", true) && hasWindowFocus()) {
+                showKeyboard(text);
+            }
+        } else if (keyboardDialog != null && keyboardDialog.isShowing() && prefs.getBoolean("auto_keyboard", true)) {
+            keyboardDialog.dismiss();
         }
     }
 
@@ -190,10 +269,20 @@ public class MainActivity extends Activity implements SamsungTv.Callback {
         });
         header.addView(statusText, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
 
+        TextView mic = button("🎤", ACCENT, 18);
+        mic.setOnClickListener(v -> {
+            haptic(v);
+            startVoice(REQ_VOICE_COMMAND);
+        });
+        mic.setOnLongClickListener(v -> {
+            showVoiceHelp();
+            return true;
+        });
+        header.addView(mic, squareLp(44));
         TextView kbd = button("Aa", KEY, 15);
         kbd.setOnClickListener(v -> {
             haptic(v);
-            showKeyboard();
+            showKeyboard("");
         });
         header.addView(kbd, squareLp(44));
         TextView settings = button("⚙", KEY, 18);
@@ -444,23 +533,91 @@ public class MainActivity extends Activity implements SamsungTv.Callback {
     private void fillApps() {
         if (appsBox == null) return;
         appsBox.removeAllViews();
-        for (int i = 0; i < apps.size(); i += 2) {
-            View a = appButton(apps.get(i));
-            View b = i + 1 < apps.size() ? appButton(apps.get(i + 1)) : new Space(this);
-            appsBox.addView(row(60, a, b));
+        iconViews.clear();
+        for (int i = 0; i < apps.size(); i += 3) {
+            View[] cells = new View[3];
+            for (int c = 0; c < 3; c++) {
+                cells[c] = i + c < apps.size() ? appButton(apps.get(i + c)) : new Space(this);
+            }
+            appsBox.addView(row(108, cells));
         }
     }
 
+    /** Colore di riserva (quando l'icona vera non è ancora arrivata) per le app più note. */
+    private static int brandColor(String name) {
+        String n = name.toLowerCase();
+        if (n.contains("youtube")) return 0xFFFF0000;
+        if (n.contains("netflix")) return 0xFFE50914;
+        if (n.contains("prime") || n.contains("amazon")) return 0xFF00A8E1;
+        if (n.contains("disney")) return 0xFF113CCF;
+        if (n.contains("spotify")) return 0xFF1DB954;
+        if (n.contains("rai")) return 0xFF0A5BB3;
+        if (n.contains("mediaset") || n.contains("infinity")) return 0xFF0C2340;
+        if (n.contains("dazn")) return 0xFF1A1A1A;
+        if (n.contains("now")) return 0xFF00B5AD;
+        if (n.contains("internet") || n.contains("browser")) return 0xFF5B6CFF;
+        int[] pal = {0xFF8E44AD, 0xFF16A085, 0xFFD35400, 0xFF2C3E50, 0xFFC0392B, 0xFF2980B9, 0xFF27AE60};
+        return pal[Math.abs(name.hashCode()) % pal.length];
+    }
+
     private View appButton(SamsungTv.AppInfo app) {
-        TextView b = button(app.name, KEY, 14);
-        b.setMaxLines(2);
-        b.setPadding(dp(8), 0, dp(8), 0);
-        b.setOnClickListener(v -> {
+        LinearLayout tile = column();
+        tile.setGravity(Gravity.CENTER);
+        tile.setPadding(dp(4), dp(8), dp(4), dp(6));
+        tile.setBackground(ripple(KEY, 14));
+        tile.setClickable(true);
+        tile.setFocusable(true);
+
+        FrameLayout iconBox = new FrameLayout(this);
+        ImageView iv = new ImageView(this);
+        iv.setScaleType(ImageView.ScaleType.FIT_CENTER);
+        iv.setClipToOutline(true);
+        TextView letter = new TextView(this);
+        letter.setGravity(Gravity.CENTER);
+        letter.setTextColor(Color.WHITE);
+        letter.setTextSize(22);
+        letter.setTypeface(Typeface.DEFAULT_BOLD);
+        String initial = app.name.trim().isEmpty() ? "?" : app.name.trim().substring(0, 1).toUpperCase();
+        letter.setText(initial);
+        iv.setTag(letter);
+
+        Bitmap bmp = loadIcon(app.id);
+        if (bmp != null) {
+            iv.setImageBitmap(bmp);
+            letter.setVisibility(View.GONE);
+        } else {
+            iv.setBackground(rounded(brandColor(app.name), 12));
+        }
+        iv.setOutlineProvider(new android.view.ViewOutlineProvider() {
+            @Override
+            public void getOutline(View view, android.graphics.Outline outline) {
+                outline.setRoundRect(0, 0, view.getWidth(), view.getHeight(), dp(12));
+            }
+        });
+        iconBox.addView(iv, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT));
+        iconBox.addView(letter, new FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT,
+                ViewGroup.LayoutParams.MATCH_PARENT));
+        iconViews.put(app.id, iv);
+        tile.addView(iconBox, new LinearLayout.LayoutParams(dp(60), dp(60)));
+
+        TextView name = new TextView(this);
+        name.setText(app.name);
+        name.setTextColor(TEXT);
+        name.setTextSize(12);
+        name.setGravity(Gravity.CENTER);
+        name.setMaxLines(1);
+        name.setEllipsize(android.text.TextUtils.TruncateAt.END);
+        LinearLayout.LayoutParams nlp = matchWrap();
+        nlp.topMargin = dp(6);
+        tile.addView(name, nlp);
+
+        tile.setOnClickListener(v -> {
             haptic(v);
             tv.launchApp(app);
             toast("Avvio " + app.name + "…");
         });
-        return b;
+        return tile;
     }
 
     private static List<SamsungTv.AppInfo> defaultApps() {
@@ -522,27 +679,183 @@ public class MainActivity extends Activity implements SamsungTv.Callback {
         ui.postDelayed(() -> tv.connect(host), 6000);
     }
 
-    private void showKeyboard() {
+    private void showKeyboard(String prefill) {
+        if (keyboardDialog != null && keyboardDialog.isShowing()) return;
+        LinearLayout box = column();
+        box.setPadding(dp(20), dp(8), dp(20), 0);
+
+        TextView hint = new TextView(this);
+        hint.setTextSize(13);
+        hint.setText(tvKeyboardOpen
+                ? "Il TV è pronto: scrivi o detta il testo e premi «Invia»."
+                : "Apri prima il campo di ricerca sul TV (es. la lente di YouTube o Netflix). "
+                + "Questa finestra si apre da sola quando il TV mostra la sua tastiera.");
+        box.addView(hint, matchWrap());
+
+        LinearLayout line = new LinearLayout(this);
+        line.setGravity(Gravity.CENTER_VERTICAL);
         EditText et = new EditText(this);
-        et.setHint("Testo da inviare");
+        et.setHint("Cosa vuoi cercare?");
         et.setSingleLine(true);
-        FrameLayout wrap = new FrameLayout(this);
-        wrap.setPadding(dp(20), dp(8), dp(20), 0);
-        wrap.addView(et);
+        et.setImeOptions(android.view.inputmethod.EditorInfo.IME_ACTION_SEND);
+        if (prefill != null && !prefill.isEmpty()) {
+            et.setText(prefill);
+            et.setSelection(prefill.length());
+        }
+        line.addView(et, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1));
+        TextView mic = button("🎤", ACCENT, 18);
+        mic.setOnClickListener(v -> {
+            haptic(v);
+            startVoice(REQ_VOICE_DICTATE);
+        });
+        line.addView(mic, squareLp(46));
+        LinearLayout.LayoutParams llp = matchWrap();
+        llp.topMargin = dp(8);
+        box.addView(line, llp);
+
+        keyboardField = et;
         AlertDialog d = new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
                 .setTitle("Scrivi sul TV")
-                .setMessage("Apri prima un campo di testo sul TV (es. la ricerca di YouTube).")
-                .setView(wrap)
-                .setPositiveButton("Invia", (di, w) -> tv.sendText(et.getText().toString()))
-                .setNeutralButton("Invia + Invio", (di, w) -> {
-                    tv.sendText(et.getText().toString());
-                    tv.key("KEY_ENTER");
-                })
-                .setNegativeButton("Annulla", null)
+                .setView(box)
+                .setPositiveButton("Invia", (di, w) -> sendTyped(et.getText().toString()))
+                .setNegativeButton("Chiudi", null)
                 .create();
+        d.setOnDismissListener(di -> {
+            if (keyboardDialog == d) {
+                keyboardDialog = null;
+                keyboardField = null;
+            }
+        });
+        et.setOnEditorActionListener((v, actionId, ev) -> {
+            sendTyped(et.getText().toString());
+            d.dismiss();
+            return true;
+        });
+        keyboardDialog = d;
         d.getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_VISIBLE);
         d.show();
         et.requestFocus();
+    }
+
+    private void sendTyped(String text) {
+        if (text.trim().isEmpty()) return;
+        tv.sendText(text);
+        toast("Inviato al TV: " + text);
+    }
+
+    // ------------------------------------------------------------------ voce
+
+    private void startVoice(int request) {
+        if (prefs.getString("host", null) == null) {
+            showSettings(true);
+            return;
+        }
+        Intent i = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
+        i.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);
+        i.putExtra(RecognizerIntent.EXTRA_LANGUAGE, "it-IT");
+        i.putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 5);
+        i.putExtra(RecognizerIntent.EXTRA_PROMPT, request == REQ_VOICE_DICTATE || tvKeyboardOpen
+                ? "Detta il testo da cercare"
+                : "Di' un comando (es. «alza il volume», «apri YouTube», «canale 5»)");
+        try {
+            keepConnection = true;
+            startActivityForResult(i, request);
+        } catch (ActivityNotFoundException e) {
+            keepConnection = false;
+            toast("Riconoscimento vocale non disponibile: installa o aggiorna l'app Google.");
+        }
+    }
+
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode != REQ_VOICE_COMMAND && requestCode != REQ_VOICE_DICTATE) return;
+        if (resultCode != RESULT_OK || data == null) return;
+        ArrayList<String> results = data.getStringArrayListExtra(RecognizerIntent.EXTRA_RESULTS);
+        if (results == null || results.isEmpty()) return;
+        String best = results.get(0);
+
+        if (requestCode == REQ_VOICE_DICTATE) {
+            if (keyboardField != null) {
+                keyboardField.setText(best);
+                keyboardField.setSelection(best.length());
+            } else {
+                sendTyped(best);
+            }
+            return;
+        }
+
+        VoiceCommands.Action a = VoiceCommands.parseBest(results, apps);
+        if (a == null && tvKeyboardOpen) {
+            // il TV aspetta del testo: la frase detta diventa la ricerca
+            sendTyped(best);
+            return;
+        }
+        if (a == null) {
+            new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+                    .setTitle("Non ho capito il comando")
+                    .setMessage("«" + best + "»\n\nSe sul TV è aperto un campo di ricerca posso scriverlo lì.")
+                    .setPositiveButton("Scrivi sul TV", (d, w) -> sendTyped(best))
+                    .setNeutralButton("Esempi", (d, w) -> showVoiceHelp())
+                    .setNegativeButton("Riprova", (d, w) -> startVoice(REQ_VOICE_COMMAND))
+                    .show();
+            return;
+        }
+        runVoiceAction(a);
+    }
+
+    private void runVoiceAction(VoiceCommands.Action a) {
+        switch (a.type) {
+            case KEYS:
+                if (a.keys.size() == 1) tv.key(a.keys.get(0));
+                else tv.keySequence(a.keys, 180);
+                break;
+            case APP:
+                tv.launchApp(a.app);
+                break;
+            case POWER_OFF:
+                if (tv.isConnected()) tv.key("KEY_POWER");
+                else {
+                    toast("Il TV sembra già spento");
+                    return;
+                }
+                break;
+            case POWER_ON:
+                if (tv.isConnected()) {
+                    toast("Il TV è già acceso");
+                    return;
+                }
+                onPowerPressed();
+                return;
+            case TEXT:
+                tv.sendText(a.text);
+                if (!tvKeyboardOpen) {
+                    toast(a.feedback + " (apri prima la ricerca sul TV se non compare)");
+                    return;
+                }
+                break;
+            default:
+                break;
+        }
+        toast(a.feedback);
+    }
+
+    private void showVoiceHelp() {
+        new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+                .setTitle("Esempi di comandi vocali")
+                .setMessage("Tocca 🎤 e di':\n\n"
+                        + "• «alza il volume» / «abbassa il volume di 5» / «muto»\n"
+                        + "• «canale 5» / «canale successivo» / «canale precedente»\n"
+                        + "• «apri YouTube» / «apri Netflix» / «Prime Video»\n"
+                        + "• «cerca Il Gladiatore» (con la ricerca aperta sul TV)\n"
+                        + "• «su», «giù 3 volte», «destra», «ok», «indietro», «home»\n"
+                        + "• «pausa», «play», «stop», «avanti veloce»\n"
+                        + "• «HDMI 2», «sorgente», «guida», «sottotitoli»\n"
+                        + "• «spegni la TV» / «accendi la TV»\n\n"
+                        + "Se il TV ha la tastiera aperta, quello che dici viene scritto direttamente nella ricerca.\n"
+                        + "Il 🎤 nella finestra «Aa» serve invece solo per dettare testo.")
+                .setPositiveButton("OK", null)
+                .show();
     }
 
     private void showSettings(boolean autoScan) {
@@ -581,6 +894,11 @@ public class MainActivity extends Activity implements SamsungTv.Callback {
         volKeys.setText("I tasti volume del telefono regolano il TV");
         volKeys.setChecked(prefs.getBoolean("volume_keys", true));
         box.addView(volKeys, matchWrap());
+
+        CheckBox autoKbd = new CheckBox(this);
+        autoKbd.setText("Apri la tastiera del telefono quando il TV mostra la sua");
+        autoKbd.setChecked(prefs.getBoolean("auto_keyboard", true));
+        box.addView(autoKbd, matchWrap());
 
         Runnable scan = () -> {
             scanBtn.setEnabled(false);
@@ -621,7 +939,8 @@ public class MainActivity extends Activity implements SamsungTv.Callback {
                     String host = ip.getText().toString().trim();
                     SharedPreferences.Editor ed = prefs.edit()
                             .putString("mac", mac.getText().toString().trim())
-                            .putBoolean("volume_keys", volKeys.isChecked());
+                            .putBoolean("volume_keys", volKeys.isChecked())
+                            .putBoolean("auto_keyboard", autoKbd.isChecked());
                     if (!host.isEmpty()) {
                         ed.putString("host", host);
                     }
