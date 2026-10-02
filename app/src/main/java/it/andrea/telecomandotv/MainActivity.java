@@ -713,11 +713,83 @@ public class MainActivity extends Activity implements SamsungTv.Callback {
         llp.topMargin = dp(8);
         box.addView(line, llp);
 
+        TextView modeLbl = new TextView(this);
+        modeLbl.setTextSize(13);
+        modeLbl.setText("Dove stai scrivendo sul TV?");
+        LinearLayout.LayoutParams mlp = matchWrap();
+        mlp.topMargin = dp(12);
+        box.addView(modeLbl, mlp);
+
+        android.widget.RadioGroup mode = new android.widget.RadioGroup(this);
+        String[] modeNames = {"Automatico (riconosce l'app aperta)", "Browser / menu Samsung", "YouTube", "Netflix",
+                "Prime Video", "RaiPlay"};
+        String[] modeKeys = {"auto", "system", "youtube", "netflix", "prime", "raiplay"};
+        String curMode = prefs.getString("kbd_mode2", "auto");
+        for (int i = 0; i < modeNames.length; i++) {
+            android.widget.RadioButton rb = new android.widget.RadioButton(this);
+            rb.setText(modeNames[i]);
+            rb.setId(View.generateViewId());
+            rb.setTag(modeKeys[i]);
+            mode.addView(rb);
+            if (modeKeys[i].equals(curMode)) rb.setChecked(true);
+        }
+        box.addView(mode, matchWrap());
+
+        CheckBox ytSearch = new CheckBox(this);
+        ytSearch.setText("Premi CERCA alla fine (YouTube, RaiPlay)");
+        ytSearch.setChecked(prefs.getBoolean("yt_search", true));
+        box.addView(ytSearch, matchWrap());
+
+        CheckBox clearFirst = new CheckBox(this);
+        clearFirst.setText("Cancella prima il testo già scritto");
+        clearFirst.setChecked(prefs.getBoolean("app_clear", false));
+        box.addView(clearFirst, matchWrap());
+
+        TextView appHint = new TextView(this);
+        appHint.setTextSize(12);
+        appHint.setText("YouTube, Netflix, Prime Video e RaiPlay hanno una tastiera loro: l'app la «batte» con le frecce. "
+                + "Apri la ricerca sul TV e non muovere il cursore prima di premere Invia. "
+                + "In «Automatico» l'app capisce da sola quale app è aperta sul TV.");
+        box.addView(appHint, matchWrap());
+
+        Runnable refreshMode = () -> {
+            View sel = mode.findViewById(mode.getCheckedRadioButtonId());
+            String m = sel != null ? (String) sel.getTag() : "system";
+            ytSearch.setVisibility("youtube".equals(m) || "raiplay".equals(m) || "auto".equals(m)
+                    ? View.VISIBLE : View.GONE);
+            clearFirst.setVisibility("system".equals(m) ? View.GONE : View.VISIBLE);
+            appHint.setVisibility("system".equals(m) ? View.GONE : View.VISIBLE);
+        };
+        mode.setOnCheckedChangeListener((g, id) -> refreshMode.run());
+        refreshMode.run();
+
+        Runnable doSend = () -> {
+            View sel = mode.findViewById(mode.getCheckedRadioButtonId());
+            String m = sel != null ? (String) sel.getTag() : "system";
+            prefs.edit().putString("kbd_mode2", m)
+                    .putBoolean("yt_search", ytSearch.isChecked())
+                    .putBoolean("app_clear", clearFirst.isChecked()).apply();
+            String text = et.getText().toString();
+            if ("youtube".equals(m)) {
+                typeInApp(AppKeyboardTyper.Layout.YOUTUBE, text, clearFirst.isChecked(), ytSearch.isChecked());
+            } else if ("netflix".equals(m)) {
+                typeInApp(AppKeyboardTyper.Layout.NETFLIX, text, clearFirst.isChecked(), false);
+            } else if ("raiplay".equals(m)) {
+                typeInApp(AppKeyboardTyper.Layout.RAIPLAY, text, clearFirst.isChecked(), ytSearch.isChecked());
+            } else if ("prime".equals(m)) {
+                typeInApp(AppKeyboardTyper.Layout.PRIME, text, clearFirst.isChecked(), false);
+            } else if ("auto".equals(m)) {
+                sendSmart(text);
+            } else {
+                sendTyped(text);
+            }
+        };
+
         keyboardField = et;
         AlertDialog d = new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
                 .setTitle("Scrivi sul TV")
-                .setView(box)
-                .setPositiveButton("Invia", (di, w) -> sendTyped(et.getText().toString()))
+                .setView(sv(box))
+                .setPositiveButton("Invia", (di, w) -> doSend.run())
                 .setNegativeButton("Chiudi", null)
                 .create();
         d.setOnDismissListener(di -> {
@@ -727,7 +799,7 @@ public class MainActivity extends Activity implements SamsungTv.Callback {
             }
         });
         et.setOnEditorActionListener((v, actionId, ev) -> {
-            sendTyped(et.getText().toString());
+            doSend.run();
             d.dismiss();
             return true;
         });
@@ -735,6 +807,96 @@ public class MainActivity extends Activity implements SamsungTv.Callback {
         d.getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_STATE_ALWAYS_VISIBLE);
         d.show();
         et.requestFocus();
+    }
+
+    private ScrollView sv(View v) {
+        ScrollView s = new ScrollView(this);
+        s.addView(v);
+        return s;
+    }
+
+    /** Batte il testo sulla tastiera a schermo dell'app (YouTube, Netflix) muovendo le frecce. */
+    private void typeInApp(AppKeyboardTyper.Layout layout, String text, boolean clearFirst, boolean pressSearch) {
+        if (text.trim().isEmpty()) return;
+        String appName = layout == AppKeyboardTyper.Layout.RAIPLAY ? "RaiPlay"
+                : layout == AppKeyboardTyper.Layout.NETFLIX ? "Netflix"
+                : layout == AppKeyboardTyper.Layout.PRIME ? "Prime Video" : "YouTube";
+        AppKeyboardTyper.Plan plan = AppKeyboardTyper.plan(layout, text, clearFirst, pressSearch);
+        long delay = prefs.getInt("yt_delay", 220);
+        int seconds = (int) Math.ceil(plan.keys.size() * delay / 1000.0);
+
+        TextView msg = new TextView(this);
+        msg.setPadding(dp(24), dp(12), dp(24), 0);
+        msg.setTextSize(14);
+        msg.setText("Sto scrivendo «" + text.trim() + "» su " + appName + "…\nCirca " + seconds + " secondi: non toccare il telecomando."
+                + (plan.skipped.length() > 0 ? "\n\nSalto i caratteri non presenti sulla tastiera: " + plan.skipped : ""));
+        AlertDialog progress = new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+                .setTitle("Digitazione su " + appName)
+                .setView(msg)
+                .setCancelable(false)
+                .setNegativeButton("Interrompi", (di, w) -> tv.cancelSequence())
+                .show();
+        tv.keySequence(plan.keys, delay, ok -> {
+            if (progress.isShowing()) progress.dismiss();
+            toast(ok ? "Fatto" : "Digitazione interrotta");
+        });
+    }
+
+    /**
+     * Comando unico: se il TV ha aperto la sua tastiera usa quella; altrimenti chiede al TV quale app
+     * è in primo piano e, se è YouTube/Netflix/Prime Video, batte il testo con le frecce.
+     */
+    private void sendSmart(String text) {
+        if (text.trim().isEmpty()) return;
+        if (tvKeyboardOpen) {
+            sendTyped(text);
+            return;
+        }
+        String host = tv.getHost();
+        if (host == null) return;
+        boolean clear = prefs.getBoolean("app_clear", false);
+        boolean search = prefs.getBoolean("yt_search", true);
+        toast("Controllo quale app è aperta sul TV…");
+        List<SamsungTv.AppInfo> known = new ArrayList<>(apps);
+        new Thread(() -> {
+            AppKeyboardTyper.Layout layout = detectForegroundApp(host, known);
+            ui.post(() -> {
+                if (layout != null) {
+                    typeInApp(layout, text, clear, search && (layout == AppKeyboardTyper.Layout.YOUTUBE
+                            || layout == AppKeyboardTyper.Layout.RAIPLAY));
+                } else {
+                    sendTyped(text);
+                    toast("App non riconosciuta: ho usato la tastiera di sistema. "
+                            + "Se non compare nulla, scegli l'app a mano in «Aa».");
+                }
+            });
+        }).start();
+    }
+
+    private static AppKeyboardTyper.Layout detectForegroundApp(String host, List<SamsungTv.AppInfo> known) {
+        Map<AppKeyboardTyper.Layout, List<String>> ids = new HashMap<>();
+        ids.put(AppKeyboardTyper.Layout.YOUTUBE, new ArrayList<>(java.util.Arrays.asList("111299001912")));
+        ids.put(AppKeyboardTyper.Layout.NETFLIX, new ArrayList<>(java.util.Arrays.asList("11101200001", "3201907018807")));
+        ids.put(AppKeyboardTyper.Layout.PRIME, new ArrayList<>(java.util.Arrays.asList("3201512006785", "3201910019365")));
+        ids.put(AppKeyboardTyper.Layout.RAIPLAY, new ArrayList<>());
+        for (SamsungTv.AppInfo a : known) {
+            String n = a.name.toLowerCase();
+            AppKeyboardTyper.Layout l = n.contains("youtube") && !n.contains("kids") && !n.contains("music")
+                    ? AppKeyboardTyper.Layout.YOUTUBE
+                    : n.contains("netflix") ? AppKeyboardTyper.Layout.NETFLIX
+                    : (n.contains("prime") || n.contains("amazon")) ? AppKeyboardTyper.Layout.PRIME
+                    : n.replace(" ", "").contains("raiplay") ? AppKeyboardTyper.Layout.RAIPLAY : null;
+            if (l != null && !ids.get(l).contains(a.id)) ids.get(l).add(a.id);
+        }
+        List<AppKeyboardTyper.Layout> running = new ArrayList<>();
+        for (Map.Entry<AppKeyboardTyper.Layout, List<String>> e : ids.entrySet()) {
+            for (String id : e.getValue()) {
+                int st = SamsungTv.appStatus(host, id);
+                if (st == 2) return e.getKey();
+                if (st == 1 && !running.contains(e.getKey())) running.add(e.getKey());
+            }
+        }
+        return running.size() == 1 ? running.get(0) : null;
     }
 
     private void sendTyped(String text) {
@@ -780,7 +942,7 @@ public class MainActivity extends Activity implements SamsungTv.Callback {
                 keyboardField.setText(best);
                 keyboardField.setSelection(best.length());
             } else {
-                sendTyped(best);
+                sendSmart(best);
             }
             return;
         }
@@ -795,7 +957,7 @@ public class MainActivity extends Activity implements SamsungTv.Callback {
             new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
                     .setTitle("Non ho capito il comando")
                     .setMessage("«" + best + "»\n\nSe sul TV è aperto un campo di ricerca posso scriverlo lì.")
-                    .setPositiveButton("Scrivi sul TV", (d, w) -> sendTyped(best))
+                    .setPositiveButton("Scrivi sul TV", (d, w) -> sendSmart(best))
                     .setNeutralButton("Esempi", (d, w) -> showVoiceHelp())
                     .setNegativeButton("Riprova", (d, w) -> startVoice(REQ_VOICE_COMMAND))
                     .show();
@@ -828,12 +990,8 @@ public class MainActivity extends Activity implements SamsungTv.Callback {
                 onPowerPressed();
                 return;
             case TEXT:
-                tv.sendText(a.text);
-                if (!tvKeyboardOpen) {
-                    toast(a.feedback + " (apri prima la ricerca sul TV se non compare)");
-                    return;
-                }
-                break;
+                sendSmart(a.text);
+                return;
             default:
                 break;
         }
@@ -899,6 +1057,31 @@ public class MainActivity extends Activity implements SamsungTv.Callback {
         autoKbd.setText("Apri la tastiera del telefono quando il TV mostra la sua");
         autoKbd.setChecked(prefs.getBoolean("auto_keyboard", true));
         box.addView(autoKbd, matchWrap());
+
+        TextView speedLbl = new TextView(this);
+        speedLbl.setTextSize(13);
+        LinearLayout.LayoutParams splp = matchWrap();
+        splp.topMargin = dp(8);
+        box.addView(speedLbl, splp);
+        android.widget.RadioGroup speed = new android.widget.RadioGroup(this);
+        speed.setOrientation(android.widget.RadioGroup.HORIZONTAL);
+        int[] delays = {350, 220, 150};
+        String[] speedNames = {"Lenta", "Normale", "Veloce"};
+        int cur = prefs.getInt("yt_delay", 220);
+        for (int i = 0; i < delays.length; i++) {
+            android.widget.RadioButton rb = new android.widget.RadioButton(this);
+            rb.setText(speedNames[i]);
+            rb.setId(View.generateViewId());
+            rb.setTag(delays[i]);
+            speed.addView(rb);
+            if (delays[i] == cur) rb.setChecked(true);
+        }
+        speedLbl.setText("Velocità digitazione nelle app (se salta lettere, scegli «Lenta»):");
+        speed.setOnCheckedChangeListener((g, id) -> {
+            View rb = g.findViewById(id);
+            if (rb != null) prefs.edit().putInt("yt_delay", (Integer) rb.getTag()).apply();
+        });
+        box.addView(speed, matchWrap());
 
         TextView logBtn = button("Registro diagnostico", KEY, 13);
         LinearLayout.LayoutParams lglp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(42));

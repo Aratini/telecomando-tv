@@ -409,19 +409,40 @@ public class SamsungTv {
         send(remote(obj("Cmd", "Click", "DataOfCmd", code, "Option", "false", "TypeOfRemote", "SendRemoteKey")));
     }
 
+    private volatile boolean cancelSequence = false;
+
     /** Invia una sequenza di tasti con una pausa tra l'uno e l'altro (es. "canale 21", "volume +5"). */
     public void keySequence(List<String> codes, long delayMs) {
+        keySequence(codes, delayMs, null);
+    }
+
+    /** Come sopra; onDone (sul thread principale) riceve true se la sequenza è arrivata in fondo. */
+    public void keySequence(List<String> codes, long delayMs, java.util.function.Consumer<Boolean> onDone) {
+        cancelSequence = false;
         exec.execute(() -> {
+            boolean completed = true;
             for (String code : codes) {
-                sendNow(remote(obj("Cmd", "Click", "DataOfCmd", code, "Option", "false",
-                        "TypeOfRemote", "SendRemoteKey")));
+                if (cancelSequence || !ensureConnected()) {
+                    completed = false;
+                    break;
+                }
+                WsClient c = ws;
+                if (c != null) c.send(remote(obj("Cmd", "Click", "DataOfCmd", code, "Option", "false",
+                        "TypeOfRemote", "SendRemoteKey")).toString());
                 try {
                     Thread.sleep(delayMs);
                 } catch (InterruptedException e) {
-                    return;
+                    completed = false;
+                    break;
                 }
             }
+            final boolean ok = completed;
+            if (onDone != null) main.post(() -> onDone.accept(ok));
         });
+    }
+
+    public void cancelSequence() {
+        cancelSequence = true;
     }
 
     public void keyPress(String code, boolean down) {
@@ -488,6 +509,33 @@ public class SamsungTv {
     }
 
     // ---------------------------------------------------------------- info dispositivo
+
+    /**
+     * Stato di un'app sul TV (GET /api/v2/applications/ID).
+     * 2 = in primo piano, 1 = avviata (il TV non dice se è in primo piano), 0 = non aperta, -1 = sconosciuto.
+     */
+    public static int appStatus(String h, String appId) {
+        try {
+            HttpURLConnection con = (HttpURLConnection) new URL("http://" + h + ":8001/api/v2/applications/"
+                    + URLEncoder.encode(appId, "UTF-8")).openConnection();
+            con.setConnectTimeout(1500);
+            con.setReadTimeout(2500);
+            if (con.getResponseCode() != 200) return -1;
+            InputStream is = con.getInputStream();
+            ByteArrayOutputStream b = new ByteArrayOutputStream();
+            byte[] buf = new byte[2048];
+            int r;
+            while ((r = is.read(buf)) > 0) b.write(buf, 0, r);
+            is.close();
+            con.disconnect();
+            JSONObject o = new JSONObject(new String(b.toByteArray(), StandardCharsets.UTF_8));
+            log("Stato app " + appId + ": " + o.toString());
+            if (o.has("visible")) return o.optBoolean("visible") ? 2 : 0;
+            return o.optBoolean("running") ? 1 : 0;
+        } catch (Exception e) {
+            return -1;
+        }
+    }
 
     /** Legge http://IP:8001/api/v2/ ; restituisce null se non è un TV Samsung. */
     public static JSONObject fetchInfo(String h, int timeoutMs) {
