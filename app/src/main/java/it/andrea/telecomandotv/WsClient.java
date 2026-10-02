@@ -190,9 +190,15 @@ public class WsClient {
                         msg.write(payload);
                         if (fin) deliver(msg, msgOpcode);
                         break;
-                    case 0x8:
+                    case 0x8: {
                         reason = "chiusa dal televisore";
+                        if (payload.length >= 2) {
+                            int code = ((payload[0] & 0xFF) << 8) | (payload[1] & 0xFF);
+                            String r = new String(payload, 2, payload.length - 2, StandardCharsets.UTF_8).trim();
+                            reason += " – codice " + code + (r.isEmpty() ? "" : ": " + r);
+                        }
                         break loop;
+                    }
                     case 0x9:
                         sendFrame(0xA, payload);
                         break;

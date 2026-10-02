@@ -66,6 +66,31 @@ public class SamsungTv {
     private volatile WsClient ws;
     private volatile State state = State.DISCONNECTED;
     private volatile String host;
+    private volatile boolean wantConnected = false;   // l'app è in primo piano e vuole restare collegata
+    private volatile boolean fallbackTried = false;   // provata già l'altra porta dopo una chiusura
+    private volatile int forcedPort = 0;
+    private volatile long lastAutoReconnect = 0;
+
+    // ---------------------------------------------------------------- registro diagnostico
+
+    private static final java.util.LinkedList<String> LOG = new java.util.LinkedList<>();
+
+    public static void log(String msg) {
+        String line = new java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.ITALY).format(new java.util.Date())
+                + "  " + msg;
+        synchronized (LOG) {
+            LOG.add(line);
+            while (LOG.size() > 80) LOG.removeFirst();
+        }
+    }
+
+    public static String getLog() {
+        synchronized (LOG) {
+            StringBuilder b = new StringBuilder();
+            for (String l : LOG) b.append(l).append('\n');
+            return b.length() == 0 ? "(vuoto)" : b.toString();
+        }
+    }
 
     public SamsungTv(SharedPreferences prefs, Callback callback) {
         this.prefs = prefs;
@@ -90,12 +115,16 @@ public class SamsungTv {
         exec.execute(() -> {
             if (!newHost.equals(host)) closeCurrent();
             host = newHost;
+            wantConnected = true;
+            fallbackTried = false;
+            forcedPort = 0;
             doConnect();
         });
     }
 
     public void disconnect() {
         exec.execute(() -> {
+            wantConnected = false;
             closeCurrent();
             setState(State.DISCONNECTED, "Disconnesso");
         });
@@ -116,29 +145,28 @@ public class SamsungTv {
         setState(State.CONNECTING, "Connessione a " + h + "…");
         String name = Base64.encodeToString(REMOTE_NAME.getBytes(StandardCharsets.UTF_8), Base64.NO_WRAP);
         String token = prefs.getString("token_" + h, null);
-        int preferred = prefs.getInt("port_" + h, 8001);
+        int preferred = forcedPort != 0 ? forcedPort : prefs.getInt("port_" + h, 8001);
         int[] ports = preferred == 8002 ? new int[]{8002, 8001} : new int[]{8001, 8002};
+        if (forcedPort != 0) ports = new int[]{forcedPort};
 
         String lastError = "";
         for (int port : ports) {
             boolean secure = port == 8002;
-            String path;
-            try {
-                path = "/api/v2/channels/samsung.remote.control?name=" + URLEncoder.encode(name, "UTF-8");
-            } catch (Exception e) {
-                path = "/api/v2/channels/samsung.remote.control?name=" + name;
-            }
+            String path = "/api/v2/channels/samsung.remote.control?name=" + name;
             if (secure && token != null) path += "&token=" + token;
-            WsClient c = new WsClient(new TvListener());
+            WsClient c = new WsClient(new TvListener(port));
             ws = c;
             try {
+                log("Connessione a " + h + ":" + port + (secure ? " (sicura" + (token != null ? ", con token)" : ")") : ""));
                 c.connect(h, port, secure, path, 4000);
+                log("Porta " + port + ": collegamento accettato, attendo autorizzazione");
                 prefs.edit().putInt("port_" + h, port).apply();
                 setStateIf(State.CONNECTING, State.WAITING_AUTH, "Se compare una richiesta sul TV, scegli «Consenti»");
                 return;
             } catch (Exception e) {
                 if (ws == c) ws = null;
                 lastError = e.getMessage();
+                log("Porta " + port + ": errore " + lastError);
             }
         }
         setState(State.DISCONNECTED, "TV non raggiungibile (" + lastError + "). È acceso e sulla stessa rete Wi-Fi?");
@@ -162,8 +190,17 @@ public class SamsungTv {
     }
 
     private class TvListener implements WsClient.Listener {
+        private final int port;
+        private volatile boolean authorized = false;
+        private volatile boolean denied = false;
+
+        TvListener(int port) {
+            this.port = port;
+        }
+
         @Override
         public void onMessage(WsClient client, String text) {
+            log("TV → " + (text.length() > 160 ? text.substring(0, 160) + "…" : text));
             try {
                 JSONObject o = new JSONObject(text);
                 String event = o.optString("event");
@@ -174,10 +211,15 @@ public class SamsungTv {
                             String t = data.optString("token", "");
                             if (!t.isEmpty() && host != null) prefs.edit().putString("token_" + host, t).apply();
                         }
+                        authorized = true;
+                        fallbackTried = false;
+                        forcedPort = 0;
+                        prefs.edit().putInt("port_" + host, port).apply();
                         setState(State.CONNECTED, "Connesso");
                         requestApps();
                         break;
                     case "ms.channel.unauthorized":
+                        denied = true;
                         setState(State.DISCONNECTED, "Il TV ha rifiutato l'accesso. Riprova e premi «Consenti» sul TV "
                                 + "(o sblocca il dispositivo in Impostazioni > Generali > Gestione dispositivi esterni).");
                         client.close();
@@ -211,9 +253,37 @@ public class SamsungTv {
 
         @Override
         public void onClose(WsClient client, String reason) {
-            if (ws == client) {
-                ws = null;
+            log("Porta " + port + ": connessione chiusa (" + reason + ")");
+            if (ws != client) return;
+            ws = null;
+            if (!wantConnected || denied) {
                 if (state != State.DISCONNECTED) setState(State.DISCONNECTED, "Connessione persa (" + reason + ")");
+                return;
+            }
+            if (!authorized) {
+                // Il TV ha chiuso prima di autorizzarci: provo l'altra porta (8001 ↔ 8002 sicura)
+                if (!fallbackTried) {
+                    fallbackTried = true;
+                    forcedPort = port == 8001 ? 8002 : 8001;
+                    log("Riprovo sulla porta " + forcedPort);
+                    setState(State.CONNECTING, "Riprovo in modalità " + (forcedPort == 8002 ? "sicura" : "normale") + "…");
+                    exec.execute(SamsungTv.this::doConnect);
+                    return;
+                }
+                forcedPort = 0;
+                setState(State.DISCONNECTED, "Il TV chiude la connessione (" + reason + "). Sul TV apri Impostazioni > "
+                        + "Generali > Gestione dispositivi esterni > Gestione connessione dispositivi: controlla che "
+                        + "«Telecomando Android» non sia bloccato, poi tocca qui per riprovare.");
+                return;
+            }
+            // Era collegato e la connessione è caduta: riconnessione automatica (al massimo una ogni 5 s)
+            long now = System.currentTimeMillis();
+            if (now - lastAutoReconnect > 5000) {
+                lastAutoReconnect = now;
+                setState(State.CONNECTING, "Riconnessione…");
+                main.postDelayed(() -> exec.execute(SamsungTv.this::doConnect), 800);
+            } else {
+                setState(State.DISCONNECTED, "Connessione persa (" + reason + "). Tocca qui per riprovare.");
             }
         }
     }

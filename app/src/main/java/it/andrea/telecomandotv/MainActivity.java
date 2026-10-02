@@ -900,6 +900,24 @@ public class MainActivity extends Activity implements SamsungTv.Callback {
         autoKbd.setChecked(prefs.getBoolean("auto_keyboard", true));
         box.addView(autoKbd, matchWrap());
 
+        TextView logBtn = button("Registro diagnostico", KEY, 13);
+        LinearLayout.LayoutParams lglp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(42));
+        lglp.topMargin = dp(8);
+        box.addView(logBtn, lglp);
+        logBtn.setOnClickListener(v -> showLog());
+
+        TextView resetBtn = button("Dimentica autorizzazione e riprova", KEY, 13);
+        LinearLayout.LayoutParams rslp = new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(42));
+        rslp.topMargin = dp(6);
+        box.addView(resetBtn, rslp);
+        resetBtn.setOnClickListener(v -> {
+            String h = prefs.getString("host", "");
+            prefs.edit().remove("token_" + h).remove("port_" + h).apply();
+            tv.disconnect();
+            if (!h.isEmpty()) tv.connect(h);
+            toast("Riprovo da zero: guarda il TV e scegli «Consenti»");
+        });
+
         Runnable scan = () -> {
             scanBtn.setEnabled(false);
             scanStatus.setText("Ricerca in corso…");
@@ -950,6 +968,28 @@ public class MainActivity extends Activity implements SamsungTv.Callback {
                 .setNegativeButton("Chiudi", null)
                 .show();
         if (autoScan) scan.run();
+    }
+
+    private void showLog() {
+        TextView t = new TextView(this);
+        t.setText(SamsungTv.getLog());
+        t.setTextSize(11);
+        t.setTypeface(Typeface.MONOSPACE);
+        t.setTextIsSelectable(true);
+        t.setPadding(dp(16), dp(8), dp(16), dp(8));
+        ScrollView sv = new ScrollView(this);
+        sv.addView(t);
+        new AlertDialog.Builder(this, android.R.style.Theme_DeviceDefault_Dialog_Alert)
+                .setTitle("Registro diagnostico")
+                .setView(sv)
+                .setPositiveButton("Copia", (d, w) -> {
+                    android.content.ClipboardManager cm =
+                            (android.content.ClipboardManager) getSystemService(CLIPBOARD_SERVICE);
+                    cm.setPrimaryClip(android.content.ClipData.newPlainText("registro", SamsungTv.getLog()));
+                    toast("Registro copiato: incollalo nella chat con Claude");
+                })
+                .setNegativeButton("Chiudi", null)
+                .show();
     }
 
     private void applyFound(NetUtils.FoundTv f, EditText ip, EditText mac, TextView status) {
